@@ -33,7 +33,7 @@ UCI Online Retail Dataset (541,909 transactions)
 
 ```bash
 # Clone repository
-git clone https://github.com/YourUsername/ecommerce-analytics.git
+git clone https://github.com/Alubinsky/ecommerce-analytics.git
 cd ecommerce-analytics
 
 # Install dependencies
