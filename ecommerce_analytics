@@ -1,0 +1,666 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings('ignore')
+
+# Machine Learning imports
+from sklearn.model_selection import train_test_split, cross_val_score, GridSearchCV
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier, IsolationForest, RandomForestRegressor
+from sklearn.cluster import KMeans
+from sklearn.metrics import (accuracy_score, classification_report, confusion_matrix,
+                           silhouette_score, davies_bouldin_score, mean_absolute_error)
+from xgboost import XGBClassifier, XGBRegressor
+from imblearn.over_sampling import SMOTE
+from imblearn.under_sampling import RandomUnderSampler
+from imblearn.pipeline import Pipeline as ImbPipeline
+
+# Statistical and time series
+from scipy import stats
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.seasonal import seasonal_decompose
+
+# Set style for better visualizations
+plt.style.use('seaborn-v0_8-darkgrid')
+sns.set_palette("husl")
+
+# ============================================================================
+# DATA LOADING AND PREPROCESSING
+# ============================================================================
+
+class EcommerceAnalyzer:
+    """Main class for e-commerce data analysis and modeling"""
+    
+    def __init__(self):
+        self.df = None
+        self.customer_features = None
+        self.models = {}
+        self.scalers = {}
+        
+    def load_data(self, fetch_from_uci=True, file_path=None):
+        """Load and preprocess the online retail dataset"""
+        
+        if fetch_from_uci:
+            from ucimlrepo import fetch_ucirepo
+            online_retail = fetch_ucirepo(id=352)
+            self.df = pd.concat([online_retail.data.features, 
+                                online_retail.data.targets], axis=1)
+        else:
+            self.df = pd.read_csv(file_path)
+        
+        print(f"✅ Loaded {len(self.df)} transactions")
+        self._preprocess_data()
+        return self
+    
+    def _preprocess_data(self):
+        """Clean and prepare data for analysis"""
+        
+        print("\n🔧 Preprocessing data...")
+        
+        # Remove cancelled orders (negative quantities)
+        self.df = self.df[self.df['Quantity'] > 0]
+        
+        # Remove outliers in UnitPrice
+        self.df = self.df[self.df['UnitPrice'] > 0]
+        self.df = self.df[self.df['UnitPrice'] < self.df['UnitPrice'].quantile(0.99)]
+        
+        # Convert InvoiceDate to datetime if it's not already
+        if 'InvoiceDate' in self.df.columns:
+            self.df['InvoiceDate'] = pd.to_datetime(self.df['InvoiceDate'])
+        
+        # Create revenue column
+        self.df['Revenue'] = self.df['Quantity'] * self.df['UnitPrice']
+        
+        # Extract time features
+        if 'InvoiceDate' in self.df.columns:
+            self.df['Year'] = self.df['InvoiceDate'].dt.year
+            self.df['Month'] = self.df['InvoiceDate'].dt.month
+            self.df['DayOfWeek'] = self.df['InvoiceDate'].dt.dayofweek
+            self.df['Hour'] = self.df['InvoiceDate'].dt.hour
+            self.df['Quarter'] = self.df['InvoiceDate'].dt.quarter
+        
+        # Clean country names
+        if 'Country' in self.df.columns:
+            self.df['Country'] = self.df['Country'].str.strip()
+        
+        print(f"✅ Cleaned data: {len(self.df)} transactions remaining")
+        
+    # ============================================================================
+    # CUSTOMER SEGMENTATION (RFM ANALYSIS)
+    # ============================================================================
+    
+    def perform_rfm_analysis(self):
+        """Perform RFM (Recency, Frequency, Monetary) analysis"""
+        
+        print("\n📊 Performing RFM Analysis...")
+        
+        # Calculate the latest date in the dataset
+        latest_date = self.df['InvoiceDate'].max()
+        
+        # RFM calculation
+        rfm = self.df.groupby('CustomerID').agg({
+            'InvoiceDate': lambda x: (latest_date - x.max()).days,  # Recency
+            'InvoiceNo': 'count',  # Frequency
+            'Revenue': 'sum'  # Monetary
+        }).reset_index()
+        
+        rfm.columns = ['CustomerID', 'Recency', 'Frequency', 'Monetary']
+        
+        # Remove outliers
+        for col in ['Recency', 'Frequency', 'Monetary']:
+            Q1 = rfm[col].quantile(0.05)
+            Q3 = rfm[col].quantile(0.95)
+            IQR = Q3 - Q1
+            rfm = rfm[(rfm[col] >= Q1 - 1.5*IQR) & (rfm[col] <= Q3 + 1.5*IQR)]
+        
+        # Create RFM scores (1-5)
+        rfm['R_Score'] = pd.qcut(rfm['Recency'], 5, labels=[5,4,3,2,1])
+        rfm['F_Score'] = pd.qcut(rfm['Frequency'].rank(method='first'), 5, labels=[1,2,3,4,5])
+        rfm['M_Score'] = pd.qcut(rfm['Monetary'], 5, labels=[1,2,3,4,5])
+        
+        # Combine scores
+        rfm['RFM_Score'] = rfm['R_Score'].astype(str) + rfm['F_Score'].astype(str) + rfm['M_Score'].astype(str)
+        
+        # Customer segments based on RFM
+        def segment_customers(row):
+            if row['RFM_Score'] in ['555', '554', '544', '545', '454', '455', '445']:
+                return 'Champions'
+            elif row['RFM_Score'] in ['543', '444', '435', '355', '354', '345', '344', '335']:
+                return 'Loyal Customers'
+            elif row['RFM_Score'] in ['553', '551', '552', '541', '542', '533', '532', '531', '452', '451']:
+                return 'Potential Loyalists'
+            elif row['RFM_Score'] in ['512', '511', '422', '421', '412', '411', '311']:
+                return 'New Customers'
+            elif row['RFM_Score'] in ['525', '524', '523', '522', '521', '515', '514', '513', '425', '424', '413', '414', '415', '315', '314', '313']:
+                return 'Promising'
+            elif row['RFM_Score'] in ['535', '534', '443', '434', '343', '334', '325', '324']:
+                return 'Need Attention'
+            elif row['RFM_Score'] in ['331', '321', '312', '221', '213', '231', '241', '251']:
+                return 'About to Sleep'
+            elif row['RFM_Score'] in ['155', '154', '144', '214', '215', '115', '114', '113']:
+                return 'At Risk'
+            elif row['RFM_Score'] in ['255', '254', '245', '244', '253', '252', '243', '242', '235', '234', '225', '224', '153', '152', '145']:
+                return 'Cannot Lose Them'
+            elif row['RFM_Score'] in ['332', '322', '231', '241', '251', '233', '232', '223', '222', '132', '123', '122', '212', '211']:
+                return 'Hibernating'
+            else:
+                return 'Lost'
+        
+        rfm['Segment'] = rfm.apply(segment_customers, axis=1)
+        
+        self.customer_features = rfm
+        print(f"✅ Segmented {len(rfm)} customers into {rfm['Segment'].nunique()} segments")
+        
+        return rfm
+    
+    # ============================================================================
+    # CUSTOMER CLUSTERING (MACHINE LEARNING)
+    # ============================================================================
+    
+    def perform_clustering(self, n_clusters=5):
+        """Perform K-Means clustering on customer features"""
+        
+        print("\n🤖 Performing Customer Clustering...")
+        
+        if self.customer_features is None:
+            self.perform_rfm_analysis()
+        
+        # Prepare features for clustering
+        features = self.customer_features[['Recency', 'Frequency', 'Monetary']].values
+        
+        # Scale features
+        scaler = StandardScaler()
+        features_scaled = scaler.fit_transform(features)
+        self.scalers['clustering'] = scaler
+        
+        # Find optimal number of clusters using elbow method
+        inertias = []
+        silhouette_scores = []
+        K_range = range(2, 11)
+        
+        for k in K_range:
+            kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+            kmeans.fit(features_scaled)
+            inertias.append(kmeans.inertia_)
+            silhouette_scores.append(silhouette_score(features_scaled, kmeans.labels_))
+        
+        # Plot elbow curve
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+        
+        ax1.plot(K_range, inertias, 'bo-')
+        ax1.set_xlabel('Number of Clusters')
+        ax1.set_ylabel('Inertia')
+        ax1.set_title('Elbow Method')
+        ax1.grid(True)
+        
+        ax2.plot(K_range, silhouette_scores, 'ro-')
+        ax2.set_xlabel('Number of Clusters')
+        ax2.set_ylabel('Silhouette Score')
+        ax2.set_title('Silhouette Score Analysis')
+        ax2.grid(True)
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # Perform final clustering
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        self.customer_features['Cluster'] = kmeans.fit_predict(features_scaled)
+        self.models['clustering'] = kmeans
+        
+        # Analyze clusters
+        cluster_summary = self.customer_features.groupby('Cluster').agg({
+            'Recency': 'mean',
+            'Frequency': 'mean',
+            'Monetary': 'mean',
+            'CustomerID': 'count'
+        }).round(2)
+        cluster_summary.columns = ['Avg_Recency', 'Avg_Frequency', 'Avg_Monetary', 'Customer_Count']
+        
+        print("\n📊 Cluster Summary:")
+        print(cluster_summary)
+        
+        return self.customer_features
+    
+    # ============================================================================
+    # CHURN PREDICTION
+    # ============================================================================
+    
+    def predict_churn(self):
+        """Predict customer churn using XGBoost"""
+        
+        print("\n🎯 Building Churn Prediction Model...")
+        
+        if self.customer_features is None:
+            self.perform_rfm_analysis()
+        
+        # Create churn label (customers who haven't purchased in last 90 days)
+        self.customer_features['Churn'] = (self.customer_features['Recency'] > 90).astype(int)
+        
+        # Prepare features
+        feature_cols = ['Recency', 'Frequency', 'Monetary']
+        X = self.customer_features[feature_cols]
+        y = self.customer_features['Churn']
+        
+        # Split data
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.3, random_state=42, stratify=y
+        )
+        
+        # Scale features
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+        self.scalers['churn'] = scaler
+        
+        # Handle class imbalance with SMOTE
+        smote = SMOTE(random_state=42)
+        X_train_balanced, y_train_balanced = smote.fit_resample(X_train_scaled, y_train)
+        
+        # Train XGBoost model
+        xgb_model = XGBClassifier(
+            n_estimators=100,
+            max_depth=5,
+            learning_rate=0.1,
+            random_state=42
+        )
+        
+        xgb_model.fit(X_train_balanced, y_train_balanced)
+        self.models['churn'] = xgb_model
+        
+        # Predictions
+        y_pred = xgb_model.predict(X_test_scaled)
+        y_pred_proba = xgb_model.predict_proba(X_test_scaled)[:, 1]
+        
+        # Evaluation
+        accuracy = accuracy_score(y_test, y_pred)
+        print(f"\n✅ Churn Model Accuracy: {accuracy:.2%}")
+        print("\nClassification Report:")
+        print(classification_report(y_test, y_pred, target_names=['Active', 'Churned']))
+        
+        # Feature importance
+        feature_importance = pd.DataFrame({
+            'Feature': feature_cols,
+            'Importance': xgb_model.feature_importances_
+        }).sort_values('Importance', ascending=False)
+        
+        print("\n📊 Feature Importance:")
+        print(feature_importance)
+        
+        # Add churn probability to customer features
+        self.customer_features['Churn_Probability'] = xgb_model.predict_proba(
+            scaler.transform(self.customer_features[feature_cols])
+        )[:, 1]
+        
+        return self.models['churn']
+    
+    # ============================================================================
+    # CUSTOMER LIFETIME VALUE PREDICTION
+    # ============================================================================
+    
+    def predict_clv(self):
+        """Predict Customer Lifetime Value using Random Forest"""
+        
+        print("\n💰 Building CLV Prediction Model...")
+        
+        if self.customer_features is None:
+            self.perform_rfm_analysis()
+        
+        # Calculate historical CLV (next 3 months revenue as proxy)
+        # This is simplified - in production, you'd use actual future revenue
+        self.customer_features['CLV'] = self.customer_features['Monetary'] * (
+            self.customer_features['Frequency'] / self.customer_features['Recency'].clip(lower=1)
+        )
+        
+        # Prepare features
+        feature_cols = ['Recency', 'Frequency', 'Monetary']
+        X = self.customer_features[feature_cols]
+        y = self.customer_features['CLV']
+        
+        # Remove outliers in CLV
+        Q1 = y.quantile(0.25)
+        Q3 = y.quantile(0.75)
+        IQR = Q3 - Q1
+        mask = (y >= Q1 - 1.5*IQR) & (y <= Q3 + 1.5*IQR)
+        X = X[mask]
+        y = y[mask]
+        
+        # Split data
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.3, random_state=42
+        )
+        
+        # Scale features
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+        self.scalers['clv'] = scaler
+        
+        # Train Random Forest model
+        rf_model = RandomForestRegressor(
+            n_estimators=100,
+            max_depth=10,
+            random_state=42
+        )
+        
+        rf_model.fit(X_train_scaled, y_train)
+        self.models['clv'] = rf_model
+        
+        # Predictions
+        y_pred = rf_model.predict(X_test_scaled)
+        
+        # Evaluation
+        mae = mean_absolute_error(y_test, y_pred)
+        r2 = rf_model.score(X_test_scaled, y_test)
+        
+        print(f"\n✅ CLV Model Performance:")
+        print(f"   R² Score: {r2:.3f}")
+        print(f"   Mean Absolute Error: ${mae:.2f}")
+        
+        # Add CLV predictions to customer features
+        self.customer_features['Predicted_CLV'] = rf_model.predict(
+            scaler.transform(self.customer_features[feature_cols])
+        )
+        
+        return self.models['clv']
+    
+    # ============================================================================
+    # FRAUD DETECTION
+    # ============================================================================
+    
+    def detect_anomalies(self, contamination=0.01):
+        """Detect fraudulent transactions using Isolation Forest"""
+        
+        print("\n🔍 Detecting Anomalous Transactions...")
+        
+        # Prepare features for anomaly detection
+        feature_cols = ['Quantity', 'UnitPrice', 'Revenue']
+        if 'Hour' in self.df.columns:
+            feature_cols.append('Hour')
+        
+        X = self.df[feature_cols].fillna(0)
+        
+        # Scale features
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+        self.scalers['fraud'] = scaler
+        
+        # Train Isolation Forest
+        iso_forest = IsolationForest(
+            contamination=contamination,
+            random_state=42,
+            n_estimators=100
+        )
+        
+        self.df['Anomaly'] = iso_forest.fit_predict(X_scaled)
+        self.df['Anomaly_Score'] = iso_forest.score_samples(X_scaled)
+        self.models['fraud'] = iso_forest
+        
+        # Analyze anomalies
+        n_anomalies = (self.df['Anomaly'] == -1).sum()
+        anomaly_revenue = self.df[self.df['Anomaly'] == -1]['Revenue'].sum()
+        
+        print(f"\n✅ Detected {n_anomalies} anomalous transactions")
+        print(f"   Total suspicious revenue: ${anomaly_revenue:,.2f}")
+        
+        # Visualize anomalies
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+        
+        # Scatter plot of normal vs anomalous transactions
+        normal = self.df[self.df['Anomaly'] == 1]
+        anomalous = self.df[self.df['Anomaly'] == -1]
+        
+        axes[0].scatter(normal['Quantity'], normal['UnitPrice'], 
+                       alpha=0.3, label='Normal', s=10)
+        axes[0].scatter(anomalous['Quantity'], anomalous['UnitPrice'], 
+                       color='red', alpha=0.7, label='Anomaly', s=20)
+        axes[0].set_xlabel('Quantity')
+        axes[0].set_ylabel('Unit Price')
+        axes[0].set_title('Anomaly Detection Results')
+        axes[0].legend()
+        axes[0].set_xlim(0, 100)
+        axes[0].set_ylim(0, 50)
+        
+        # Distribution of anomaly scores
+        axes[1].hist(self.df['Anomaly_Score'], bins=50, edgecolor='black')
+        axes[1].axvline(x=self.df[self.df['Anomaly'] == -1]['Anomaly_Score'].max(), 
+                       color='red', linestyle='--', label='Threshold')
+        axes[1].set_xlabel('Anomaly Score')
+        axes[1].set_ylabel('Frequency')
+        axes[1].set_title('Distribution of Anomaly Scores')
+        axes[1].legend()
+        
+        plt.tight_layout()
+        plt.show()
+        
+        return self.df[self.df['Anomaly'] == -1]
+    
+    # ============================================================================
+    # REVENUE FORECASTING
+    # ============================================================================
+    
+    def forecast_revenue(self, periods=30):
+        """Forecast future revenue using ARIMA"""
+        
+        print("\n📈 Forecasting Revenue...")
+        
+        # Aggregate daily revenue
+        daily_revenue = self.df.groupby(self.df['InvoiceDate'].dt.date)['Revenue'].sum()
+        daily_revenue.index = pd.to_datetime(daily_revenue.index)
+        
+        # Fill missing dates with 0
+        idx = pd.date_range(daily_revenue.index.min(), daily_revenue.index.max())
+        daily_revenue = daily_revenue.reindex(idx, fill_value=0)
+        
+        # Decompose time series
+        decomposition = seasonal_decompose(daily_revenue, model='additive', period=7)
+        
+        fig, axes = plt.subplots(4, 1, figsize=(12, 10))
+        
+        daily_revenue.plot(ax=axes[0], title='Original Revenue')
+        decomposition.trend.plot(ax=axes[1], title='Trend')
+        decomposition.seasonal.plot(ax=axes[2], title='Seasonal')
+        decomposition.resid.plot(ax=axes[3], title='Residual')
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # Fit ARIMA model
+        model = ARIMA(daily_revenue, order=(5, 1, 2))
+        model_fit = model.fit()
+        
+        # Make predictions
+        forecast = model_fit.forecast(steps=periods)
+        forecast_index = pd.date_range(start=daily_revenue.index[-1] + timedelta(days=1), 
+                                      periods=periods)
+        
+        # Visualization
+        plt.figure(figsize=(12, 6))
+        plt.plot(daily_revenue.index[-60:], daily_revenue.values[-60:], 
+                label='Historical', color='blue')
+        plt.plot(forecast_index, forecast, label='Forecast', 
+                color='red', linestyle='--')
+        plt.fill_between(forecast_index, 
+                        forecast - 1.96 * forecast.std(), 
+                        forecast + 1.96 * forecast.std(), 
+                        alpha=0.3, color='red')
+        plt.xlabel('Date')
+        plt.ylabel('Revenue ($)')
+        plt.title('Revenue Forecast (Next 30 Days)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.show()
+        
+        total_forecast = forecast.sum()
+        print(f"\n✅ Forecasted revenue for next {periods} days: ${total_forecast:,.2f}")
+        print(f"   Average daily revenue: ${forecast.mean():,.2f}")
+        
+        return forecast
+    
+    # ============================================================================
+    # MARKET ANALYSIS
+    # ============================================================================
+    
+    def analyze_markets(self):
+        """Analyze performance by country/market"""
+        
+        print("\n🌍 Analyzing Market Performance...")
+        
+        # Country-wise analysis
+        country_stats = self.df.groupby('Country').agg({
+            'Revenue': 'sum',
+            'InvoiceNo': 'nunique',
+            'CustomerID': 'nunique',
+            'Quantity': 'sum'
+        }).round(2)
+        
+        country_stats.columns = ['Total_Revenue', 'Total_Orders', 
+                                 'Total_Customers', 'Total_Items']
+        country_stats['Avg_Order_Value'] = (
+            country_stats['Total_Revenue'] / country_stats['Total_Orders']
+        ).round(2)
+        country_stats['Revenue_Per_Customer'] = (
+            country_stats['Total_Revenue'] / country_stats['Total_Customers']
+        ).round(2)
+        
+        # Sort by revenue
+        country_stats = country_stats.sort_values('Total_Revenue', ascending=False)
+        
+        # Calculate market share
+        country_stats['Market_Share_%'] = (
+            100 * country_stats['Total_Revenue'] / country_stats['Total_Revenue'].sum()
+        ).round(2)
+        
+        print("\n📊 Top 10 Markets by Revenue:")
+        print(country_stats.head(10))
+        
+        # Visualizations
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        
+        # Top 10 countries by revenue
+        top10 = country_stats.head(10)
+        axes[0, 0].barh(top10.index[::-1], top10['Total_Revenue'][::-1])
+        axes[0, 0].set_xlabel('Total Revenue ($)')
+        axes[0, 0].set_title('Top 10 Markets by Revenue')
+        
+        # Market share pie chart
+        axes[0, 1].pie(top10['Market_Share_%'], labels=top10.index, 
+                      autopct='%1.1f%%', startangle=90)
+        axes[0, 1].set_title('Market Share Distribution')
+        
+        # Average order value by country
+        axes[1, 0].barh(top10.index[::-1], top10['Avg_Order_Value'][::-1])
+        axes[1, 0].set_xlabel('Average Order Value ($)')
+        axes[1, 0].set_title('Average Order Value by Market')
+        
+        # Customer value by country
+        axes[1, 1].barh(top10.index[::-1], top10['Revenue_Per_Customer'][::-1])
+        axes[1, 1].set_xlabel('Revenue per Customer ($)')
+        axes[1, 1].set_title('Customer Value by Market')
+        
+        plt.tight_layout()
+        plt.show()
+        
+        return country_stats
+    
+    # ============================================================================
+    # PRODUCT ANALYSIS
+    # ============================================================================
+    
+    def analyze_products(self, top_n=20):
+        """Analyze product performance and associations"""
+        
+        print("\n📦 Analyzing Product Performance...")
+        
+        # Product performance
+        product_stats = self.df.groupby('StockCode').agg({
+            'Description': 'first',
+            'Quantity': 'sum',
+            'Revenue': 'sum',
+            'InvoiceNo': 'nunique'
+        }).round(2)
+        
+        product_stats.columns = ['Product', 'Total_Quantity', 
+                                 'Total_Revenue', 'Order_Count']
+        product_stats = product_stats.sort_values('Total_Revenue', ascending=False)
+        
+        print(f"\n📊 Top {top_n} Products by Revenue:")
+        print(product_stats.head(top_n)[['Product', 'Total_Revenue', 'Order_Count']])
+        
+        # Market basket analysis (simplified)
+        basket = self.df.groupby(['InvoiceNo', 'Description'])['Quantity'].sum().unstack().fillna(0)
+        basket = basket.applymap(lambda x: 1 if x > 0 else 0)
+        
+        # Calculate product associations
+        from itertools import combinations
+        
+        associations = []
+        min_support = 0.01
+        
+        for item1, item2 in combinations(basket.columns[:50], 2):  # Limit to top 50 for speed
+            item1_support = basket[item1].mean()
+            item2_support = basket[item2].mean()
+            both_support = (basket[item1] * basket[item2]).mean()
+            
+            if both_support > min_support:
+                confidence = both_support / item1_support if item1_support > 0 else 0
+                lift = confidence / item2_support if item2_support > 0 else 0
+                
+                associations.append({
+                    'Product_A': item1[:30],
+                    'Product_B': item2[:30],
+                    'Support': both_support,
+                    'Confidence': confidence,
+                    'Lift': lift
+                })
+        
+        associations_df = pd.DataFrame(associations)
+        associations_df = associations_df.sort_values('Lift', ascending=False)
+        
+        print("\n🔗 Top Product Associations (Cross-selling opportunities):")
+        print(associations_df.head(10))
+        
+        return product_stats, associations_df
+    
+    # ============================================================================
+    # GENERATE COMPREHENSIVE REPORT
+    # ============================================================================
+    
+    def generate_report(self):
+        """Generate a comprehensive business intelligence report"""
+        
+        print("\n" + "="*60)
+        print("📊 E-COMMERCE ANALYTICS REPORT")
+        print("="*60)
+        
+        # Basic statistics
+        print("\n📈 BUSINESS OVERVIEW:")
+        print(f"   Total Revenue: ${self.df['Revenue'].sum():,.2f}")
+        print(f"   Total Orders: {self.df['InvoiceNo'].nunique():,}")
+        print(f"   Total Customers: {self.df['CustomerID'].nunique():,}")
+        print(f"   Average Order Value: ${self.df.groupby('InvoiceNo')['Revenue'].sum().mean():,.2f}")
+        print(f"   Date Range: {self.df['InvoiceDate'].min()} to {self.df['InvoiceDate'].max()}")
+        
+        # Customer segmentation
+        if self.customer_features is not None:
+            print("\n👥 CUSTOMER INSIGHTS:")
+            segment_summary = self.customer_features.groupby('Segment').size()
+            print(f"   Customer Segments:")
+            for segment, count in segment_summary.items():
+                print(f"      {segment}: {count} ({100*count/len(self.customer_features):.1f}%)")
+            
+            if 'Churn_Probability' in self.customer_features.columns:
+                at_risk = (self.customer_features['Churn_Probability'] > 0.7).sum()
+                print(f"\n   ⚠️  Customers at Risk: {at_risk}")
+                print(f"   Potential Revenue Loss: ${self.customer_features[self.customer_features['Churn_Probability'] > 0.7]['Monetary'].sum():,.2f}")
+        
+        # Fraud detection
+        if 'Anomaly' in self.df.columns:
+            n_anomalies = (self.df['Anomaly'] == -1).sum()
+            anomaly_revenue = self.df[self.df['Anomaly'] == -1]['Revenue'].sum()
+            print(f"\n🔍 FRAUD DETECTION:")
+            print(f"   Suspicious Transactions: {n_anomalies}")
+            print(f"   Suspicious Revenue: ${anomaly_revenue
